@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
 import { queryOne, run } from '@/lib/db';
 import { getOpenClawClient } from '@/lib/openclaw/client';
+import { getAgentMonitor } from '@/lib/agent-monitor';
 import { broadcast } from '@/lib/events';
 import { getProjectsPath, getMissionControlUrl } from '@/lib/config';
 import type { Task, Agent, OpenClawSession } from '@/lib/types';
@@ -78,9 +79,9 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       const openclawSessionId = `mission-control-${agent.name.toLowerCase().replace(/\s+/g, '-')}`;
       
       run(
-        `INSERT INTO openclaw_sessions (id, agent_id, openclaw_session_id, channel, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [sessionId, agent.id, openclawSessionId, 'mission-control', 'active', now, now]
+        `INSERT INTO openclaw_sessions (id, agent_id, task_id, openclaw_session_id, channel, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [sessionId, agent.id, task.id, openclawSessionId, 'mission-control', 'active', now, now]
       );
 
       session = queryOne<OpenClawSession>(
@@ -186,6 +187,15 @@ If you need help or clarification, ask me (Charlie).`;
           now
         ]
       );
+
+      // Start monitoring the agent's session for responses
+      const monitor = getAgentMonitor();
+      monitor.startMonitoring({
+        taskId: task.id,
+        agentId: agent.id,
+        agentName: agent.name,
+        openclawSessionId: session.openclaw_session_id,
+      });
 
       return NextResponse.json({
         success: true,
