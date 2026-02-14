@@ -63,10 +63,6 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
       if (res.ok) {
         const data = await res.json();
         setState(data);
-        
-        if (data.isComplete && onSpecLocked) {
-          onSpecLocked();
-        }
       }
     } catch (err) {
       console.error('Failed to load planning state:', err);
@@ -74,7 +70,7 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
     } finally {
       setLoading(false);
     }
-  }, [taskId, onSpecLocked]);
+  }, [taskId]);
 
   useEffect(() => {
     loadState();
