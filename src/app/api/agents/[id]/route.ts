@@ -72,6 +72,10 @@ export async function PATCH(
       updates.push('is_master = ?');
       values.push(body.is_master ? 1 : 0);
     }
+    if (body.model !== undefined) {
+      updates.push('model = ?');
+      values.push(body.model);
+    }
     if (body.soul_md !== undefined) {
       updates.push('soul_md = ?');
       values.push(body.soul_md);

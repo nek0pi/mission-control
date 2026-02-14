@@ -151,6 +151,20 @@ const migrations: Migration[] = [
         console.log('[Migration 004] Added planning_agents');
       }
     }
+  },
+  {
+    id: '005',
+    name: 'add_agent_model',
+    up: (db) => {
+      console.log('[Migration 005] Adding model column to agents...');
+      
+      const agentsInfo = db.prepare("PRAGMA table_info(agents)").all() as { name: string }[];
+      
+      if (!agentsInfo.some(col => col.name === 'model')) {
+        db.exec(`ALTER TABLE agents ADD COLUMN model TEXT DEFAULT 'google/gemini-3-flash-preview'`);
+        console.log('[Migration 005] Added model column to agents');
+      }
+    }
   }
 ];
 

@@ -29,6 +29,7 @@ export interface Agent {
   status: AgentStatus;
   is_master: boolean;
   workspace_id: string;
+  model?: string;
   soul_md?: string;
   user_md?: string;
   agents_md?: string;
@@ -223,6 +224,7 @@ export interface CreateAgentRequest {
   description?: string;
   avatar_emoji?: string;
   is_master?: boolean;
+  model?: string;
   soul_md?: string;
   user_md?: string;
   agents_md?: string;
@@ -269,6 +271,16 @@ export interface OpenClawSessionInfo {
   peer?: string;
   model?: string;
   status: string;
+}
+
+/** Model info as returned by the OpenClaw Gateway */
+export interface GatewayModel {
+  id: string;
+  name?: string;
+  provider?: string;
+  description?: string;
+  /** Any additional fields the Gateway returns */
+  [key: string]: unknown;
 }
 
 // OpenClaw history message format (from Gateway)

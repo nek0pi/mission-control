@@ -5,6 +5,7 @@ import { getOpenClawClient } from '@/lib/openclaw/client';
 import { getAgentMonitor } from '@/lib/agent-monitor';
 import { broadcast } from '@/lib/events';
 import { getProjectsPath, getMissionControlUrl } from '@/lib/config';
+import { DEFAULT_MODEL } from '@/lib/models';
 import type { Task, Agent, OpenClawSession } from '@/lib/types';
 
 interface RouteParams {
@@ -12,10 +13,37 @@ interface RouteParams {
 }
 
 /**
+ * Build a system prompt for the agent based on its configuration and the task context.
+ * This is sent to the Gateway so the LLM knows its role and how to behave.
+ */
+function buildSystemPrompt(agent: Agent, task: Task & { assigned_agent_name?: string }): string {
+  const parts: string[] = [];
+
+  parts.push(`You are ${agent.name}, a specialized AI agent.`);
+  parts.push(`Role: ${agent.role}`);
+
+  if (agent.description) {
+    parts.push(`\nDescription: ${agent.description}`);
+  }
+
+  if (agent.soul_md) {
+    parts.push(`\n${agent.soul_md}`);
+  }
+
+  parts.push(`\nYou are working within the Mission Control system.`);
+  parts.push(`Your task ID is: ${task.id}`);
+  parts.push(`You should focus on completing the assigned task thoroughly and report back when done.`);
+  parts.push(`When you finish your work, include "TASK_COMPLETE: [brief summary]" in your final message.`);
+
+  return parts.join('\n');
+}
+
+/**
  * POST /api/tasks/[id]/dispatch
  * 
  * Dispatches a task to its assigned agent's OpenClaw session.
- * Creates session if needed, sends task details to agent.
+ * Creates a properly configured LLM-backed session on the Gateway,
+ * then sends the task details to the agent.
  */
 export async function POST(request: NextRequest, { params }: RouteParams) {
   try {
@@ -142,11 +170,33 @@ When complete, reply with:
 
 If you need help or clarification, ask me (Charlie).`;
 
-    // Send message to agent's session using chat.send
+    // Create the agent's chat session on the Gateway and send the task message
     try {
       // Use sessionKey for routing to the agent's session
       // Format: agent:main:{openclaw_session_id}
       const sessionKey = `agent:main:${session.openclaw_session_id}`;
+      const agentModel = agent.model || DEFAULT_MODEL;
+
+      // Build system prompt from the agent's configuration
+      const systemPrompt = buildSystemPrompt(agent, task);
+
+      // CRITICAL: Create a properly configured LLM-backed session on the Gateway.
+      // Without this, chat.send goes to a session with no model behind it.
+      console.log(`[Dispatch] Creating Gateway session: ${sessionKey} with model: ${agentModel}`);
+      try {
+        await client.createChatSession({
+          sessionKey,
+          model: agentModel,
+          systemPrompt,
+        });
+        console.log(`[Dispatch] Gateway session created successfully`);
+      } catch (createErr) {
+        // Session might already exist (e.g. re-dispatch) - log but continue
+        console.warn(`[Dispatch] chat.create returned:`, createErr instanceof Error ? createErr.message : createErr);
+        console.log(`[Dispatch] Continuing with chat.send (session may already exist)`);
+      }
+
+      // Now send the task message to the properly configured session
       await client.call('chat.send', {
         sessionKey,
         message: taskMessage,

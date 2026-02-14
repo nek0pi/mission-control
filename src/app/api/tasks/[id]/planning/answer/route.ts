@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
 import { getOpenClawClient } from '@/lib/openclaw/client';
+import { DEFAULT_MODEL } from '@/lib/models';
 
 // Helper to extract JSON from a response that might have markdown code blocks or surrounding text
 function extractJSON(text: string): object | null {
@@ -228,8 +229,8 @@ If planning is complete, respond with JSON:
           
           if (parsed.agents && parsed.agents.length > 0) {
             const insertAgent = getDb().prepare(`
-              INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, soul_md, created_at, updated_at)
-              VALUES (?, (SELECT workspace_id FROM tasks WHERE id = ?), ?, ?, ?, ?, 'standby', ?, datetime('now'), datetime('now'))
+              INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, model, soul_md, created_at, updated_at)
+              VALUES (?, (SELECT workspace_id FROM tasks WHERE id = ?), ?, ?, ?, ?, 'standby', ?, ?, datetime('now'), datetime('now'))
             `);
 
             for (const agent of parsed.agents) {
@@ -243,6 +244,7 @@ If planning is complete, respond with JSON:
                 agent.role,
                 agent.instructions || '',
                 agent.avatar_emoji || '🤖',
+                DEFAULT_MODEL,
                 agent.soul_md || ''
               );
             }

@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS agents (
   status TEXT DEFAULT 'standby' CHECK (status IN ('standby', 'working', 'offline')),
   is_master INTEGER DEFAULT 0,
   workspace_id TEXT DEFAULT 'default' REFERENCES workspaces(id),
+  model TEXT DEFAULT 'google/gemini-3-flash-preview',
   soul_md TEXT,
   user_md TEXT,
   agents_md TEXT,

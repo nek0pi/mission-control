@@ -1,7 +1,7 @@
 // OpenClaw Gateway WebSocket Client
 
 import { EventEmitter } from 'events';
-import type { OpenClawMessage, OpenClawSessionInfo } from '../types';
+import type { OpenClawMessage, OpenClawSessionInfo, GatewayModel } from '../types';
 
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'ws://127.0.0.1:18789';
 const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || '';
@@ -259,6 +259,43 @@ export class OpenClawClient extends EventEmitter {
 
   async createSession(channel: string, peer?: string): Promise<OpenClawSessionInfo> {
     return this.call<OpenClawSessionInfo>('sessions.create', { channel, peer });
+  }
+
+  /**
+   * Create (or ensure) an agent chat session on the Gateway with model + system prompt.
+   * This must be called before `chat.send` for new agent sessions so the Gateway
+   * knows which LLM model to use and what system instructions to apply.
+   * 
+   * @param sessionKey - The session key (e.g. "agent:main:mission-control-market-researcher")
+   * @param model - The OpenRouter model ID (e.g. "google/gemini-3-flash-preview")
+   * @param systemPrompt - The agent's system prompt / personality (soul_md)
+   */
+  async createChatSession(params: {
+    sessionKey: string;
+    model: string;
+    systemPrompt?: string;
+  }): Promise<unknown> {
+    return this.call('chat.create', {
+      sessionKey: params.sessionKey,
+      model: params.model,
+      system: params.systemPrompt || undefined,
+    });
+  }
+
+  /**
+   * List available LLM models from the Gateway.
+   * The Gateway knows which models are configured and available via its providers.
+   */
+  async listModels(): Promise<GatewayModel[]> {
+    const result = await this.call<GatewayModel[] | { models: GatewayModel[] }>('models.list');
+    // Handle both array response and wrapped { models: [...] } response
+    if (Array.isArray(result)) {
+      return result;
+    }
+    if (result && typeof result === 'object' && 'models' in result) {
+      return result.models;
+    }
+    return [];
   }
 
   // Node methods (device capabilities)
