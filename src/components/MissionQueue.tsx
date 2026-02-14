@@ -1,7 +1,7 @@
 'use client';
 
-import { useState } from 'react';
-import { Plus, ChevronRight, GripVertical } from 'lucide-react';
+import { useState, useEffect, useCallback } from 'react';
+import { Plus, ChevronRight, ChevronLeft, GripVertical } from 'lucide-react';
 import { useMissionControl } from '@/lib/store';
 import type { Task, TaskStatus } from '@/lib/types';
 import { TaskModal } from './TaskModal';
@@ -26,6 +26,33 @@ export function MissionQueue({ workspaceId }: MissionQueueProps) {
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [editingTask, setEditingTask] = useState<Task | null>(null);
   const [draggedTask, setDraggedTask] = useState<Task | null>(null);
+
+  // Collapsed columns state, persisted to localStorage
+  const [collapsedColumns, setCollapsedColumns] = useState<Set<TaskStatus>>(() => {
+    if (typeof window === 'undefined') return new Set();
+    try {
+      const stored = localStorage.getItem('mc-collapsed-columns');
+      return stored ? new Set(JSON.parse(stored) as TaskStatus[]) : new Set();
+    } catch {
+      return new Set();
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem('mc-collapsed-columns', JSON.stringify([...collapsedColumns]));
+  }, [collapsedColumns]);
+
+  const toggleColumn = useCallback((columnId: TaskStatus) => {
+    setCollapsedColumns((prev) => {
+      const next = new Set(prev);
+      if (next.has(columnId)) {
+        next.delete(columnId);
+      } else {
+        next.add(columnId);
+      }
+      return next;
+    });
+  }, []);
 
   const getTasksByStatus = (status: TaskStatus) =>
     tasks.filter((task) => task.status === status);
@@ -98,6 +125,40 @@ export function MissionQueue({ workspaceId }: MissionQueueProps) {
       <div className="flex-1 flex gap-3 p-3 overflow-x-auto">
         {COLUMNS.map((column) => {
           const columnTasks = getTasksByStatus(column.id);
+          const isCollapsed = collapsedColumns.has(column.id);
+
+          if (isCollapsed) {
+            return (
+              <div
+                key={column.id}
+                className={`w-10 min-w-[40px] flex flex-col items-center bg-mc-bg rounded-lg border border-mc-border/50 border-t-2 cursor-pointer transition-all hover:bg-mc-bg-secondary hover:border-mc-border group ${column.color}`}
+                onClick={() => toggleColumn(column.id)}
+                onDragOver={handleDragOver}
+                onDrop={(e) => handleDrop(e, column.id)}
+                title={`Expand ${column.label}`}
+              >
+                {/* Task count badge */}
+                <div className="pt-2 pb-1">
+                  <span className="text-xs bg-mc-bg-tertiary px-1.5 py-0.5 rounded text-mc-text-secondary">
+                    {columnTasks.length}
+                  </span>
+                </div>
+
+                {/* Rotated label */}
+                <div className="flex-1 flex items-center justify-center">
+                  <span className="text-[10px] font-medium uppercase text-mc-text-secondary tracking-wider whitespace-nowrap [writing-mode:vertical-lr] rotate-180 select-none">
+                    {column.label}
+                  </span>
+                </div>
+
+                {/* Expand hint */}
+                <div className="pb-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <ChevronRight className="w-3.5 h-3.5 text-mc-text-secondary" />
+                </div>
+              </div>
+            );
+          }
+
           return (
             <div
               key={column.id}
@@ -110,9 +171,21 @@ export function MissionQueue({ workspaceId }: MissionQueueProps) {
                 <span className="text-xs font-medium uppercase text-mc-text-secondary">
                   {column.label}
                 </span>
-                <span className="text-xs bg-mc-bg-tertiary px-2 py-0.5 rounded text-mc-text-secondary">
-                  {columnTasks.length}
-                </span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs bg-mc-bg-tertiary px-2 py-0.5 rounded text-mc-text-secondary">
+                    {columnTasks.length}
+                  </span>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleColumn(column.id);
+                    }}
+                    className="p-0.5 rounded hover:bg-mc-bg-tertiary text-mc-text-secondary/60 hover:text-mc-text-secondary transition-colors"
+                    title={`Collapse ${column.label}`}
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               </div>
 
               {/* Tasks */}
