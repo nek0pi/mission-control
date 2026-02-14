@@ -5,11 +5,15 @@
 
 import { NextRequest } from 'next/server';
 import { registerClient, unregisterClient } from '@/lib/events';
+import { getAgentMonitor } from '@/lib/agent-monitor';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET(request: NextRequest) {
   const encoder = new TextEncoder();
+
+  // Ensure the agent monitor is running (resumes in-progress tasks on first call)
+  getAgentMonitor();
 
   // Create a readable stream for SSE
   const stream = new ReadableStream({
