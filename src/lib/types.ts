@@ -342,10 +342,52 @@ export interface GatewayAgentEvent {
   sessionKey?: string;
   summary?: string;
   tokens_used?: number;
+  /** Actual Gateway fields */
+  stream?: 'assistant' | 'lifecycle' | string;
+  data?: {
+    text?: string;
+    phase?: 'start' | 'end' | string;
+    endedAt?: number;
+  };
+  seq?: number;
+}
+
+/** Content block inside a Gateway chat message */
+export interface GatewayChatContentBlock {
+  type: 'text' | 'toolCall' | string;
+  text?: string;
+  /** Tool call fields (when type === 'toolCall') */
+  id?: string;
+  name?: string;
+  arguments?: Record<string, unknown> | string;
+}
+
+/** A single message inside a Gateway chat event */
+export interface GatewayChatMessage {
+  role: 'user' | 'assistant' | 'toolResult' | string;
+  content?: GatewayChatContentBlock[];
+  timestamp?: number;
+  /** Tool result fields (when role === 'toolResult') */
+  toolCallId?: string;
+  toolName?: string;
+  details?: {
+    status?: string;
+    exitCode?: number;
+    durationMs?: number;
+    aggregated?: string;
+    cwd?: string;
+  };
+  isError?: boolean;
 }
 
 export interface GatewayChatEvent {
   sessionKey?: string;
+  runId?: string;
+  seq?: number;
+  /** 'delta' for streaming updates, 'final' for completed messages */
+  state?: 'delta' | 'final' | string;
+  message?: GatewayChatMessage;
+  /** Legacy fields */
   text?: string;
   role?: string;
 }

@@ -4,7 +4,7 @@ import { queryOne, run } from '@/lib/db';
 import { getOpenClawClient } from '@/lib/openclaw/client';
 import { getAgentMonitor } from '@/lib/agent-monitor';
 import { broadcast } from '@/lib/events';
-import { getProjectsPath, getMissionControlUrl } from '@/lib/config';
+import { getMissionControlUrl } from '@/lib/config';
 import { DEFAULT_MODEL } from '@/lib/models';
 import type { Task, Agent, OpenClawSession } from '@/lib/types';
 
@@ -140,10 +140,10 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       urgent: '🔴'
     }[task.priority] || '⚪';
 
-    // Get project path for deliverables
-    const projectsPath = getProjectsPath();
-    const projectDir = task.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-    const taskProjectDir = `${projectsPath}/${projectDir}`;
+    // Build a relative directory name for this task's deliverables.
+    // Fallback to the task ID if the title has no alphanumeric characters.
+    const projectDir = task.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+      || `task-${task.id}`;
     const missionControlUrl = getMissionControlUrl();
 
     const taskMessage = `${priorityEmoji} **NEW TASK ASSIGNED**
@@ -154,14 +154,23 @@ ${task.description ? `**Description:** ${task.description}\n` : ''}
 ${task.due_date ? `**Due:** ${task.due_date}\n` : ''}
 **Task ID:** ${task.id}
 
-**OUTPUT DIRECTORY:** ${taskProjectDir}
-Create this directory and save all deliverables there.
+**DELIVERABLE DIRECTORY (relative):** ${projectDir}/
+Use this as the relative path prefix when uploading deliverables.
 
 **IMPORTANT:** After completing work, you MUST call these APIs:
 1. Log activity: POST ${missionControlUrl}/api/tasks/${task.id}/activities
    Body: {"activity_type": "completed", "message": "Description of what was done"}
-2. Register deliverable: POST ${missionControlUrl}/api/tasks/${task.id}/deliverables
-   Body: {"deliverable_type": "file", "title": "File name", "path": "${taskProjectDir}/filename.html"}
+2. Upload & register deliverable (single call):
+   POST ${missionControlUrl}/api/tasks/${task.id}/deliverables
+   Body: {
+     "deliverable_type": "file",
+     "title": "Descriptive name",
+     "relative_path": "${projectDir}/filename.html",
+     "content": "<full file content here>",
+     "description": "optional description"
+   }
+   The server saves the file and registers it automatically.
+   You may call this endpoint multiple times for multiple files.
 3. Update status: PATCH ${missionControlUrl}/api/tasks/${task.id}
    Body: {"status": "review"}
 
@@ -196,17 +205,17 @@ If you need help or clarification, ask me (Charlie).`;
         console.log(`[Dispatch] Continuing with chat.send (session may already exist)`);
       }
 
-      // Now send the task message to the properly configured session
-      await client.call('chat.send', {
-        sessionKey,
-        message: taskMessage,
-        idempotencyKey: `dispatch-${task.id}-${Date.now()}`
-      });
-
-      // Update task status to in_progress
+      // Update task status to in_progress BEFORE sending so the UI
+      // reflects the correct state while the agent works.
       run(
         'UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?',
         ['in_progress', now, id]
+      );
+
+      // Update agent status to working
+      run(
+        'UPDATE agents SET status = ?, updated_at = ? WHERE id = ?',
+        ['working', now, agent.id]
       );
 
       // Broadcast task update
@@ -217,12 +226,6 @@ If you need help or clarification, ask me (Charlie).`;
           payload: updatedTask,
         });
       }
-
-      // Update agent status to working
-      run(
-        'UPDATE agents SET status = ?, updated_at = ? WHERE id = ?',
-        ['working', now, agent.id]
-      );
 
       // Log dispatch event
       run(
@@ -238,13 +241,29 @@ If you need help or clarification, ask me (Charlie).`;
         ]
       );
 
-      // Start monitoring the agent's session for responses
+      // Start monitoring BEFORE sending the message so that event
+      // listeners are attached and will capture streaming tool calls,
+      // chat messages, and agent lifecycle events in real-time.
       const monitor = getAgentMonitor();
       monitor.startMonitoring({
         taskId: task.id,
         agentId: agent.id,
         agentName: agent.name,
         openclawSessionId: session.openclaw_session_id,
+      });
+
+      // Fire chat.send in the background — do NOT await.
+      // The Gateway streams events while the agent works, and the
+      // AgentMonitor picks them up via WebSocket event listeners.
+      // The RPC response (with the full transcript) only arrives
+      // after the agent finishes, so awaiting it here would block
+      // the HTTP response for the entire agent execution time.
+      client.call('chat.send', {
+        sessionKey,
+        message: taskMessage,
+        idempotencyKey: `dispatch-${task.id}-${Date.now()}`
+      }).catch((err) => {
+        console.error(`[Dispatch] Background chat.send failed for task "${task.id}":`, err);
       });
 
       return NextResponse.json({

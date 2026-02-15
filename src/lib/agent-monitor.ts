@@ -3,13 +3,17 @@
  * 
  * Hybrid monitoring service that combines:
  * 
- * 1. **Event-driven** (primary): Subscribes to Gateway push events (tool_call,
- *    tool_result, agent) for real-time, step-by-step activity tracking.
+ * 1. **Event-driven** (primary): Subscribes to Gateway streaming events.
+ *    The `event:chat` stream carries every message — including assistant tool
+ *    calls and tool results — as they happen.  Each is logged as a separate
+ *    activity entry for full real-time visibility.
  * 2. **Polling** (fallback): Polls chat.history on a slower cadence to catch
  *    anything missed during reconnections (Gateway events are not replayed).
  * 
- * Each tool call and tool result the agent executes is logged as a separate
- * activity entry, giving full visibility into agent behaviour.
+ * The Gateway does NOT push separate `tool_call` / `tool_result` event types.
+ * Instead, tool calls and results are embedded inside `event:chat` messages:
+ *   - role:"assistant" + content[type:"toolCall"] → tool invocation
+ *   - role:"toolResult" → tool execution result with output + exit code
  */
 
 import { v4 as uuidv4 } from 'uuid';
@@ -25,11 +29,14 @@ import type {
   GatewayToolCallEvent,
   GatewayToolResultEvent,
   GatewayAgentEvent,
+  GatewayChatEvent,
+  GatewayChatContentBlock,
+  GatewayChatMessage,
 } from '@/lib/types';
 
 // ─── Configuration ──────────────────────────────────────────────────
 
-/** Polling interval — slower now that events are the primary channel */
+/** Polling interval — slower now that streaming events are the primary channel */
 const POLL_INTERVAL_MS = 15_000;
 
 /** Maximum number of messages to fetch per poll */
@@ -58,6 +65,12 @@ interface MonitoredSession {
   errorCount: number;
   /** Timestamp of last Gateway event received for this session (0 = never) */
   lastEventAt: number;
+  /** Set of session-level seq numbers already processed (dedup between delta/final) */
+  processedSeqs: Set<number>;
+  /** Set of tool call IDs already logged (shared dedup across streaming + polling) */
+  loggedToolCallIds: Set<string>;
+  /** Whether TASK_COMPLETE has been detected (prevent double-completion) */
+  completionHandled: boolean;
 }
 
 // ─── Monitor Class ──────────────────────────────────────────────────
@@ -103,6 +116,9 @@ class AgentSessionMonitor {
       startedAt: Date.now(),
       errorCount: 0,
       lastEventAt: 0,
+      processedSeqs: new Set(),
+      loggedToolCallIds: new Set(),
+      completionHandled: false,
     });
 
     // Build reverse lookup for event correlation
@@ -214,23 +230,28 @@ class AgentSessionMonitor {
 
     const client = getOpenClawClient();
 
-    // tool_call: Agent is invoking a tool (shell, file read, API call, etc.)
-    client.on('event:tool_call', (payload: GatewayToolCallEvent) => {
-      this.handleToolCallEvent(payload);
+    // ── PRIMARY: Chat events carry tool calls and results ──────────
+    // The Gateway streams every message (assistant text, tool calls,
+    // tool results) as `event:chat` with state "delta" or "final".
+    client.on('event:chat', (payload: GatewayChatEvent) => {
+      this.handleChatEvent(payload);
     });
 
-    // tool_result: Tool execution completed with output
-    client.on('event:tool_result', (payload: GatewayToolResultEvent) => {
-      this.handleToolResultEvent(payload);
-    });
-
-    // agent: Streaming agent status / thinking updates
+    // ── Agent lifecycle events (start / end of agent run) ─────────
     client.on('event:agent', (payload: GatewayAgentEvent) => {
       this.handleAgentEvent(payload);
     });
 
+    // ── Fallback: If the Gateway ever adds dedicated tool events ──
+    client.on('event:tool_call', (payload: GatewayToolCallEvent) => {
+      this.handleLegacyToolCallEvent(payload);
+    });
+    client.on('event:tool_result', (payload: GatewayToolResultEvent) => {
+      this.handleLegacyToolResultEvent(payload);
+    });
+
     this.eventsAttached = true;
-    console.log('[AgentMonitor] Gateway event listeners attached (tool_call, tool_result, agent)');
+    console.log('[AgentMonitor] Gateway event listeners attached (chat, agent, tool_call, tool_result)');
   }
 
   /**
@@ -265,10 +286,270 @@ class AgentSessionMonitor {
     return null;
   }
 
+  // ─── Chat Event Handler (Primary) ─────────────────────────────
+
   /**
-   * Handle a tool_call event from the Gateway.
+   * Handle a `event:chat` push from the Gateway.
+   *
+   * Every message in the agent conversation is streamed as a chat event:
+   *   state:"delta" → partial / streaming update
+   *   state:"final" → message is complete
+   *
+   * We process "final" events to avoid double-logging deltas.
+   * Each message's content blocks are inspected:
+   *   - type:"toolCall"  → log as tool_called activity
+   *   - type:"text"      → check for TASK_COMPLETE pattern
+   *   - role:"toolResult" → log as tool_result activity
    */
-  private handleToolCallEvent(payload: GatewayToolCallEvent): void {
+  private handleChatEvent(payload: GatewayChatEvent): void {
+    const session = this.resolveSession(payload);
+    if (!session) return;
+    session.lastEventAt = Date.now();
+
+    // Only process "final" events to avoid duplicate logging from deltas.
+    // Tool calls complete almost instantly so the delay is negligible.
+    if (payload.state !== 'final') return;
+
+    // Deduplicate: skip if we've already processed this session seq
+    if (payload.seq !== undefined) {
+      if (session.processedSeqs.has(payload.seq)) return;
+      session.processedSeqs.add(payload.seq);
+
+      // Prune old seqs to prevent unbounded growth (keep last 200)
+      if (session.processedSeqs.size > 200) {
+        const seqs = Array.from(session.processedSeqs).sort((a, b) => a - b);
+        const toRemove = seqs.slice(0, seqs.length - 200);
+        for (const seq of toRemove) {
+          session.processedSeqs.delete(seq);
+        }
+      }
+
+      // Also prune loggedToolCallIds (keep last 400 — covers ~200 call+result pairs)
+      if (session.loggedToolCallIds.size > 400) {
+        const ids = Array.from(session.loggedToolCallIds);
+        const toRemove = ids.slice(0, ids.length - 400);
+        for (const id of toRemove) {
+          session.loggedToolCallIds.delete(id);
+        }
+      }
+    }
+
+    const message = payload.message;
+    if (!message) return;
+
+    // ── Tool result messages ────────────────────────────────────
+    if (message.role === 'toolResult') {
+      this.handleStreamedToolResult(session, message);
+      return;
+    }
+
+    // ── Assistant messages (tool calls + text) ──────────────────
+    if (message.role === 'assistant' && message.content) {
+      for (const block of message.content) {
+        if (block.type === 'toolCall' && block.name) {
+          this.handleStreamedToolCall(session, block);
+        } else if (block.type === 'text' && block.text) {
+          // Check for TASK_COMPLETE in assistant text
+          this.checkForCompletion(session, block.text);
+        }
+      }
+    }
+  }
+
+  /**
+   * Log a tool call from a streamed chat message content block.
+   * Shared by both the streaming handler and the polling fallback.
+   */
+  private handleStreamedToolCall(session: MonitoredSession, block: GatewayChatContentBlock): void {
+    // Dedup: skip if we've already logged this tool call (prevents
+    // duplicates when both streaming events and polling catch the same call)
+    if (block.id) {
+      if (session.loggedToolCallIds.has(block.id)) return;
+      session.loggedToolCallIds.add(block.id);
+    }
+
+    const toolName = block.name || 'unknown';
+
+    // Parse arguments — may be a JSON string or an object
+    let args: Record<string, unknown> = {};
+    if (typeof block.arguments === 'string') {
+      try { args = JSON.parse(block.arguments); } catch { /* keep empty */ }
+    } else if (block.arguments && typeof block.arguments === 'object') {
+      args = block.arguments;
+    }
+
+    const argsPreview = Object.keys(args).length > 0
+      ? JSON.stringify(args).substring(0, 150)
+      : '';
+
+    // Build a human-readable message
+    let activityMessage: string;
+    if ((toolName === 'shell' || toolName === 'exec') && args.command) {
+      activityMessage = `Running command: ${String(args.command)}`;
+    } else if (toolName === 'file_read' || toolName === 'read') {
+      activityMessage = `Reading file: ${String(args.path || args.file_path || args.file || '')}`;
+    } else if (toolName === 'file_write' || toolName === 'write') {
+      activityMessage = `Writing file: ${String(args.path || args.file_path || args.file || '')}`;
+    } else if (toolName === 'sessions_list') {
+      activityMessage = `Listing active sessions`;
+    } else if (toolName === 'sessions_send') {
+      activityMessage = `Sending message to session: ${String(args.sessionKey || args.session_key || '')}`;
+    } else if (toolName === 'browser' || toolName === 'web_search') {
+      activityMessage = `${toolName}: ${String(args.url || args.query || argsPreview)}`;
+    } else {
+      activityMessage = `Tool call: ${toolName}`;
+      if (argsPreview) activityMessage += ` ${argsPreview}`;
+    }
+
+    // Truncate if needed
+    if (activityMessage.length > MAX_ACTIVITY_MESSAGE_LENGTH) {
+      activityMessage = activityMessage.substring(0, MAX_ACTIVITY_MESSAGE_LENGTH - 3) + '...';
+    }
+
+    const metadata = JSON.stringify({
+      tool: toolName,
+      args,
+      status: 'executing',
+      toolCallId: block.id,
+    });
+
+    this.logActivity(session, 'tool_called', activityMessage, metadata);
+  }
+
+  /**
+   * Log a tool result from a streamed chat message.
+   * Shared by both the streaming handler and the polling fallback.
+   */
+  private handleStreamedToolResult(session: MonitoredSession, message: GatewayChatMessage): void {
+    // Dedup: skip if we've already logged the result for this tool call
+    // (toolCallId links a result back to the originating tool call)
+    const resultKey = message.toolCallId ? `result:${message.toolCallId}` : null;
+    if (resultKey) {
+      if (session.loggedToolCallIds.has(resultKey)) return;
+      session.loggedToolCallIds.add(resultKey);
+    }
+
+    const toolName = message.toolName || 'unknown';
+    const details = message.details;
+    const exitCode = details?.exitCode;
+    const isError = message.isError === true;
+
+    // Extract text output from content blocks
+    let output = '';
+    if (message.content) {
+      for (const block of message.content) {
+        if (block.type === 'text' && block.text) {
+          output += block.text;
+        }
+      }
+    }
+
+    // Also include aggregated output from details if present
+    if (!output && details?.aggregated) {
+      output = details.aggregated;
+    }
+
+    // Build a readable message
+    let activityMessage: string;
+    if (isError || (exitCode !== undefined && exitCode !== 0)) {
+      activityMessage = `${toolName} failed`;
+      if (exitCode !== undefined) activityMessage += ` (exit ${exitCode})`;
+      // Show a short preview of the error output
+      const preview = output.length > 120
+        ? output.substring(0, 117) + '...'
+        : output;
+      if (preview) activityMessage += `: ${preview}`;
+    } else {
+      // Show a short preview of the output
+      const preview = output.length > 120
+        ? output.substring(0, 117) + '...'
+        : output;
+      activityMessage = preview
+        ? `${toolName} result: ${preview}`
+        : `${toolName} completed`;
+      if (details?.durationMs) {
+        activityMessage += ` (${details.durationMs}ms)`;
+      }
+    }
+
+    if (activityMessage.length > MAX_ACTIVITY_MESSAGE_LENGTH) {
+      activityMessage = activityMessage.substring(0, MAX_ACTIVITY_MESSAGE_LENGTH - 3) + '...';
+    }
+
+    // Store full output in metadata for expandable view in UI
+    const truncatedOutput = output.length > MAX_TOOL_OUTPUT_LENGTH
+      ? output.substring(0, MAX_TOOL_OUTPUT_LENGTH - 3) + '...'
+      : output;
+
+    const metadata = JSON.stringify({
+      tool: toolName,
+      output: truncatedOutput,
+      exit_code: exitCode ?? (isError ? 1 : 0),
+      duration_ms: details?.durationMs,
+      status: details?.status || (isError ? 'error' : 'completed'),
+      toolCallId: message.toolCallId,
+    });
+
+    this.logActivity(session, 'tool_result', activityMessage, metadata);
+  }
+
+  /**
+   * Check a text message for the TASK_COMPLETE pattern and handle completion.
+   */
+  private checkForCompletion(session: MonitoredSession, text: string): void {
+    if (session.completionHandled) return;
+
+    const completionMatch = text.match(/TASK_COMPLETE:\s*(.+)/i);
+    if (completionMatch) {
+      session.completionHandled = true;
+      const summary = completionMatch[1].trim();
+      // Use void to handle the async without blocking
+      void this.handleTaskCompletion(session, summary, new Date().toISOString());
+    }
+  }
+
+  // ─── Agent Event Handler ──────────────────────────────────────
+
+  /**
+   * Handle an `event:agent` push from the Gateway.
+   *
+   * Actual payload shape from the Gateway:
+   *   { stream: "assistant", data: { text: "..." }, sessionKey, seq }
+   *   { stream: "lifecycle", data: { phase: "start"|"end", ... }, sessionKey, seq }
+   *
+   * We only log meaningful lifecycle events, not token-level text streaming.
+   */
+  private handleAgentEvent(payload: GatewayAgentEvent): void {
+    const session = this.resolveSession(payload);
+    if (!session) return;
+    session.lastEventAt = Date.now();
+
+    // Handle lifecycle events (actual Gateway format)
+    if (payload.stream === 'lifecycle') {
+      if (payload.data?.phase === 'start') {
+        this.logActivity(session, 'agent_thinking', 'Agent is processing...', null);
+      }
+      // "end" phase is handled by TASK_COMPLETE detection in chat events
+      return;
+    }
+
+    // Legacy format fallback: payload.status / payload.summary
+    if (payload.status === 'accepted') {
+      this.logActivity(session, 'agent_thinking', 'Agent is thinking...', null);
+    } else if (payload.summary) {
+      this.logActivity(session, 'updated', payload.summary, JSON.stringify({
+        status: payload.status,
+        tokens_used: payload.tokens_used,
+      }));
+    }
+    // Ignore assistant text streaming events (stream:"assistant") — too noisy
+  }
+
+  // ─── Legacy Tool Event Handlers (Fallback) ────────────────────
+  // Kept in case the Gateway ever adds dedicated tool_call / tool_result
+  // event types. Currently these events are NOT emitted by the Gateway.
+
+  private handleLegacyToolCallEvent(payload: GatewayToolCallEvent): void {
     const session = this.resolveSession(payload);
     if (!session) return;
     session.lastEventAt = Date.now();
@@ -278,9 +559,8 @@ class AgentSessionMonitor {
       ? JSON.stringify(payload.args).substring(0, 150)
       : '';
 
-    // Build a human-readable message
     let message: string;
-    if (toolName === 'shell' && payload.args?.command) {
+    if ((toolName === 'shell' || toolName === 'exec') && payload.args?.command) {
       message = `Running command: ${String(payload.args.command)}`;
     } else if (toolName === 'file_read' || toolName === 'read') {
       message = `Reading file: ${String(payload.args?.path || payload.args?.file || '')}`;
@@ -293,7 +573,6 @@ class AgentSessionMonitor {
       if (argsPreview) message += ` ${argsPreview}`;
     }
 
-    // Truncate if needed
     if (message.length > MAX_ACTIVITY_MESSAGE_LENGTH) {
       message = message.substring(0, MAX_ACTIVITY_MESSAGE_LENGTH - 3) + '...';
     }
@@ -307,10 +586,7 @@ class AgentSessionMonitor {
     this.logActivity(session, 'tool_called', message, metadata);
   }
 
-  /**
-   * Handle a tool_result event from the Gateway.
-   */
-  private handleToolResultEvent(payload: GatewayToolResultEvent): void {
+  private handleLegacyToolResultEvent(payload: GatewayToolResultEvent): void {
     const session = this.resolveSession(payload);
     if (!session) return;
     session.lastEventAt = Date.now();
@@ -319,12 +595,10 @@ class AgentSessionMonitor {
     const exitCode = payload.exit_code;
     const output = payload.output || '';
 
-    // Build a readable message
     let message: string;
     if (exitCode !== undefined && exitCode !== 0) {
       message = `${toolName} failed (exit ${exitCode})`;
     } else {
-      // Show a short preview of the output
       const preview = output.length > 120
         ? output.substring(0, 117) + '...'
         : output;
@@ -337,7 +611,6 @@ class AgentSessionMonitor {
       message = message.substring(0, MAX_ACTIVITY_MESSAGE_LENGTH - 3) + '...';
     }
 
-    // Store full output in metadata for expandable view in UI
     const truncatedOutput = output.length > MAX_TOOL_OUTPUT_LENGTH
       ? output.substring(0, MAX_TOOL_OUTPUT_LENGTH - 3) + '...'
       : output;
@@ -349,29 +622,6 @@ class AgentSessionMonitor {
     });
 
     this.logActivity(session, 'tool_result', message, metadata);
-  }
-
-  /**
-   * Handle an agent event from the Gateway (thinking / streaming status).
-   * These are batched — we only log meaningful status changes, not every token.
-   */
-  private handleAgentEvent(payload: GatewayAgentEvent): void {
-    const session = this.resolveSession(payload);
-    if (!session) return;
-    session.lastEventAt = Date.now();
-
-    // Only log if there's a meaningful status or summary (skip token-level streaming)
-    if (payload.status === 'accepted') {
-      this.logActivity(session, 'agent_thinking', 'Agent is thinking...', null);
-    } else if (payload.summary) {
-      // Agent run completed — this may overlap with the TASK_COMPLETE polling detection,
-      // but that's fine — the completion handler is idempotent.
-      this.logActivity(session, 'updated', payload.summary, JSON.stringify({
-        status: payload.status,
-        tokens_used: payload.tokens_used,
-      }));
-    }
-    // Ignore other streaming events (token deltas) to avoid noise
   }
 
   // ─── Activity Logging Helper ────────────────────────────────────
@@ -488,9 +738,10 @@ class AgentSessionMonitor {
   /**
    * Poll a single session for new messages.
    * 
-   * Now that events are the primary channel, polling mainly serves to:
-   * - Detect TASK_COMPLETE patterns for the completion workflow
-   * - Catch messages that may have been missed during reconnection gaps
+   * Now that `event:chat` streaming is the primary channel, polling serves to:
+   * - Detect TASK_COMPLETE patterns missed during reconnection gaps
+   * - Log tool calls/results from chat.history if streaming events were missed
+   * - Verify task is still active
    */
   private async pollSession(
     client: ReturnType<typeof getOpenClawClient>,
@@ -515,7 +766,11 @@ class AgentSessionMonitor {
       const result = await client.call<{
         messages: Array<{
           role: string;
-          content: Array<{ type: string; text?: string }>;
+          content?: Array<{ type: string; text?: string; name?: string; id?: string; arguments?: unknown }>;
+          toolCallId?: string;
+          toolName?: string;
+          details?: { status?: string; exitCode?: number; durationMs?: number; aggregated?: string };
+          isError?: boolean;
         }>;
       }>('chat.history', {
         sessionKey: session.sessionKey,
@@ -524,48 +779,45 @@ class AgentSessionMonitor {
 
       const allMessages = result.messages || [];
 
-      // Extract assistant messages
-      const assistantMessages: string[] = [];
-      for (const msg of allMessages) {
-        if (msg.role === 'assistant') {
-          const textContent = msg.content?.find((c) => c.type === 'text');
-          if (textContent?.text) {
-            assistantMessages.push(textContent.text);
-          }
-        }
-      }
-
-      const newMessageCount = assistantMessages.length - session.lastSeenMessageCount;
+      // Count all messages (not just assistant text) for the message counter
+      const totalMessages = allMessages.length;
+      const newMessageCount = totalMessages - session.lastSeenMessageCount;
       if (newMessageCount <= 0) {
         session.errorCount = 0;
         return;
       }
 
-      const newMessages = assistantMessages.slice(session.lastSeenMessageCount);
-      session.lastSeenMessageCount = assistantMessages.length;
+      const newMessages = allMessages.slice(session.lastSeenMessageCount);
+      session.lastSeenMessageCount = totalMessages;
       session.errorCount = 0;
 
-      for (const messageText of newMessages) {
-        // Check for TASK_COMPLETE pattern (primary purpose of polling now)
-        const completionMatch = messageText.match(/TASK_COMPLETE:\s*(.+)/i);
-        if (completionMatch) {
-          const summary = completionMatch[1].trim();
-          await this.handleTaskCompletion(session, summary, new Date().toISOString());
-          return;
+      // If streaming events are actively flowing, skip detailed polling logging
+      // to avoid duplicating what the chat event handler already captures.
+      const eventsSilentMs = Date.now() - session.lastEventAt;
+      const eventsAreActive = session.lastEventAt > 0 && eventsSilentMs < POLL_INTERVAL_MS * 2;
+
+      for (const msg of newMessages) {
+        // ── Check for TASK_COMPLETE in assistant text messages ──
+        if (msg.role === 'assistant' && msg.content) {
+          for (const block of msg.content) {
+            if (block.type === 'text' && block.text) {
+              this.checkForCompletion(session, block.text);
+            }
+          }
+
+          // Log tool calls from history if events were missed
+          if (!eventsAreActive) {
+            for (const block of msg.content) {
+              if (block.type === 'toolCall' && block.name) {
+                this.handleStreamedToolCall(session, block as GatewayChatContentBlock);
+              }
+            }
+          }
         }
 
-        // Only log via polling if this session hasn't received Gateway events
-        // recently. If events are actively flowing, they provide richer
-        // step-by-step tracking and polling would just duplicate data.
-        const eventsSilentMs = Date.now() - session.lastEventAt;
-        const eventsAreActive = session.lastEventAt > 0 && eventsSilentMs < POLL_INTERVAL_MS * 2;
-
-        if (!eventsAreActive) {
-          const truncated =
-            messageText.length > MAX_ACTIVITY_MESSAGE_LENGTH
-              ? messageText.substring(0, MAX_ACTIVITY_MESSAGE_LENGTH - 3) + '...'
-              : messageText;
-          this.logActivity(session, 'updated', truncated, null);
+        // ── Log tool results from history if events were missed ──
+        if (msg.role === 'toolResult' && !eventsAreActive) {
+          this.handleStreamedToolResult(session, msg as GatewayChatMessage);
         }
       }
     } catch (err) {
