@@ -140,7 +140,7 @@ export interface OpenClawSession {
   updated_at: string;
 }
 
-export type ActivityType = 'spawned' | 'updated' | 'completed' | 'file_created' | 'status_changed';
+export type ActivityType = 'spawned' | 'updated' | 'completed' | 'file_created' | 'status_changed' | 'tool_called' | 'tool_result' | 'agent_thinking';
 
 export interface TaskActivity {
   id: string;
@@ -316,4 +316,47 @@ export interface SSEEvent {
   } | {
     id: string;  // For task_deleted events
   };
+}
+
+// OpenClaw Gateway push event types
+export interface GatewayToolCallEvent {
+  tool: string;
+  args: Record<string, unknown>;
+  status: 'executing' | 'completed' | 'failed';
+  sessionKey?: string;
+  runId?: string;
+}
+
+export interface GatewayToolResultEvent {
+  tool: string;
+  output: string;
+  exit_code?: number;
+  sessionKey?: string;
+  runId?: string;
+}
+
+export interface GatewayAgentEvent {
+  text?: string;
+  status?: string;
+  runId?: string;
+  sessionKey?: string;
+  summary?: string;
+  tokens_used?: number;
+}
+
+export interface GatewayChatEvent {
+  sessionKey?: string;
+  text?: string;
+  role?: string;
+}
+
+/** Union of all known Gateway event payloads keyed by event name */
+export interface GatewayEventMap {
+  'tool_call': GatewayToolCallEvent;
+  'tool_result': GatewayToolResultEvent;
+  'agent': GatewayAgentEvent;
+  'chat': GatewayChatEvent;
+  'tick': Record<string, unknown>;
+  'presence': Record<string, unknown>;
+  'health': Record<string, unknown>;
 }

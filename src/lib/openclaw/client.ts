@@ -165,7 +165,7 @@ export class OpenClawClient extends EventEmitter {
     return this.connecting;
   }
 
-  private handleMessage(data: OpenClawMessage & { type?: string; ok?: boolean; payload?: unknown }): void {
+  private handleMessage(data: OpenClawMessage & { type?: string; event?: string; ok?: boolean; payload?: unknown; seq?: number; stateVersion?: number }): void {
     // Handle OpenClaw ResponseFrame format (type: "res")
     if (data.type === 'res' && data.id !== undefined) {
       const requestId = data.id as string | number;
@@ -183,6 +183,15 @@ export class OpenClawClient extends EventEmitter {
       }
     }
 
+    // Handle OpenClaw EventFrame format (type: "event")
+    // Gateway pushes events like: tool_call, tool_result, agent, chat, presence, tick, etc.
+    if (data.type === 'event' && data.event) {
+      console.log(`[OpenClaw] Event received: ${data.event}`, JSON.stringify(data.payload ?? {}).substring(0, 200));
+      this.emit('gateway_event', { event: data.event, payload: data.payload, seq: data.seq });
+      this.emit(`event:${data.event}`, data.payload);
+      return;
+    }
+
     // Handle legacy JSON-RPC responses
     const legacyId = data.id as string | number | undefined;
     if (legacyId !== undefined && this.pendingRequests.has(legacyId)) {
@@ -197,7 +206,7 @@ export class OpenClawClient extends EventEmitter {
       return;
     }
 
-    // Handle events/notifications
+    // Handle events/notifications (legacy method-based format)
     if (data.method) {
       this.emit('notification', data);
       this.emit(data.method, data.params);
