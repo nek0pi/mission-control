@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
 import { getOpenClawClient } from '@/lib/openclaw/client';
+import { broadcast } from '@/lib/events';
 // File system imports removed - using OpenClaw API instead
 
 // Planning session prefix for OpenClaw (must match agent:main: format)
@@ -224,6 +225,23 @@ Respond with ONLY valid JSON in this format:
       SET planning_session_key = ?, planning_messages = ?, status = 'planning'
       WHERE id = ?
     `).run(sessionKey, JSON.stringify(messages), taskId);
+
+    // Broadcast task status change to 'planning' via SSE
+    const updatedTask = getDb().prepare(`
+      SELECT t.*,
+        aa.name as assigned_agent_name,
+        aa.avatar_emoji as assigned_agent_emoji,
+        ca.name as created_by_agent_name,
+        ca.avatar_emoji as created_by_agent_emoji
+      FROM tasks t
+      LEFT JOIN agents aa ON t.assigned_agent_id = aa.id
+      LEFT JOIN agents ca ON t.created_by_agent_id = ca.id
+      WHERE t.id = ?
+    `).get(taskId);
+
+    if (updatedTask) {
+      broadcast({ type: 'task_updated', payload: updatedTask as import('@/lib/types').Task });
+    }
 
     // Poll for response (give OpenClaw time to process)
     // Use OpenClaw API to get messages

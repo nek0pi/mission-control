@@ -76,6 +76,30 @@ export function PlanningTab({ taskId, onSpecLocked }: PlanningTabProps) {
     loadState();
   }, [loadState]);
 
+  // Poll for updates when waiting for AI response (no currentQuestion yet)
+  useEffect(() => {
+    if (!state?.isStarted || state?.isComplete || state?.currentQuestion) {
+      return;
+    }
+
+    const poll = async () => {
+      try {
+        const res = await fetch(`/api/tasks/${taskId}/planning`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.currentQuestion || data.isComplete) {
+            setState(data);
+          }
+        }
+      } catch (err) {
+        console.error('Failed to poll planning state:', err);
+      }
+    };
+
+    const interval = setInterval(poll, 2000);
+    return () => clearInterval(interval);
+  }, [taskId, state?.isStarted, state?.isComplete, state?.currentQuestion]);
+
   // Start planning session
   const startPlanning = async () => {
     setStarting(true);

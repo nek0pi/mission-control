@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
 import { getOpenClawClient } from '@/lib/openclaw/client';
 import { DEFAULT_MODEL } from '@/lib/models';
+import { broadcast } from '@/lib/events';
 
 // Helper to extract JSON from a response that might have markdown code blocks or surrounding text
 function extractJSON(text: string): object | null {
@@ -248,6 +249,23 @@ If planning is complete, respond with JSON:
                 agent.soul_md || ''
               );
             }
+          }
+
+          // Broadcast task update (planning complete, status → inbox) via SSE
+          const completedTask = getDb().prepare(`
+            SELECT t.*,
+              aa.name as assigned_agent_name,
+              aa.avatar_emoji as assigned_agent_emoji,
+              ca.name as created_by_agent_name,
+              ca.avatar_emoji as created_by_agent_emoji
+            FROM tasks t
+            LEFT JOIN agents aa ON t.assigned_agent_id = aa.id
+            LEFT JOIN agents ca ON t.created_by_agent_id = ca.id
+            WHERE t.id = ?
+          `).get(taskId);
+
+          if (completedTask) {
+            broadcast({ type: 'task_updated', payload: completedTask as import('@/lib/types').Task });
           }
 
           // AUTO-DISPATCH: Assign to first agent and trigger dispatch
