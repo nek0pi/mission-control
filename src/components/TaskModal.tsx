@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { X, Save, Trash2, Activity, Package, Bot, ClipboardList, Plus } from 'lucide-react';
+import { X, Save, Trash2, Activity, Package, Bot, ClipboardList, Plus, Play, SkipForward, Check, RotateCcw } from 'lucide-react';
 import { useMissionControl } from '@/lib/store';
 import { ActivityLog } from './ActivityLog';
 import { DeliverablesList } from './DeliverablesList';
@@ -22,6 +22,7 @@ export function TaskModal({ task, onClose, workspaceId }: TaskModalProps) {
   const { agents, addTask, updateTask, addEvent } = useMissionControl();
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [showAgentModal, setShowAgentModal] = useState(false);
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
   // Auto-switch to planning tab if task is in planning status
   const [activeTab, setActiveTab] = useState<TabType>(task?.status === 'planning' ? 'planning' : 'overview');
 
@@ -115,6 +116,74 @@ export function TaskModal({ task, onClose, workspaceId }: TaskModalProps) {
     }
   };
 
+  /**
+   * Run automated tests on a task's deliverables.
+   */
+  const handleRunTests = async () => {
+    if (!task) return;
+    setActionLoading('run-tests');
+    try {
+      const res = await fetch(`/api/tasks/${task.id}/test`, { method: 'POST' });
+      const result = await res.json();
+
+      if (!res.ok) {
+        // API returned an error (400 = no deliverables, 500 = execution failure)
+        addEvent({
+          id: crypto.randomUUID(),
+          type: 'task_status_changed',
+          task_id: task.id,
+          message: `Tests could not run for "${task.title}": ${result.error || `HTTP ${res.status}`}`,
+          created_at: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Refresh task to reflect new status
+      const taskRes = await fetch(`/api/tasks/${task.id}`);
+      if (taskRes.ok) {
+        updateTask(await taskRes.json());
+      }
+
+      const passed = result.passed === true;
+      addEvent({
+        id: crypto.randomUUID(),
+        type: 'task_status_changed',
+        task_id: task.id,
+        message: passed
+          ? `Tests passed for "${task.title}" — moved to review`
+          : `Tests failed for "${task.title}" — sent back for fixes`,
+        created_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error('Failed to run tests:', error);
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  /**
+   * Change a task's status via PATCH and refresh local state.
+   */
+  const handleStatusAction = async (newStatus: TaskStatus, actionKey: string) => {
+    if (!task) return;
+    setActionLoading(actionKey);
+    try {
+      const res = await fetch(`/api/tasks/${task.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: newStatus }),
+      });
+      if (res.ok) {
+        const updatedTask = await res.json();
+        updateTask(updatedTask);
+      }
+    } catch (error) {
+      console.error('Failed to update task status:', error);
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   const statuses: TaskStatus[] = ['planning', 'inbox', 'assigned', 'in_progress', 'testing', 'review', 'done'];
   const priorities: TaskPriority[] = ['low', 'normal', 'high', 'urgent'];
 
@@ -159,6 +228,55 @@ export function TaskModal({ task, onClose, workspaceId }: TaskModalProps) {
                 {tab.label}
               </button>
             ))}
+          </div>
+        )}
+
+        {/* Status Action Bar — shown for testing/review statuses across all tabs */}
+        {task && task.status === 'testing' && (
+          <div className="flex items-center gap-3 px-4 py-3 bg-amber-500/10 border-b border-amber-500/30 flex-shrink-0">
+            <div className="flex-1 text-sm text-amber-300">
+              <span className="font-medium">Testing</span> — Awaiting automated tests
+            </div>
+            <button
+              onClick={handleRunTests}
+              disabled={actionLoading !== null}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 rounded text-sm font-medium transition-colors disabled:opacity-50"
+            >
+              <Play className="w-3.5 h-3.5" />
+              {actionLoading === 'run-tests' ? 'Running...' : 'Run Tests'}
+            </button>
+            <button
+              onClick={() => handleStatusAction('review', 'skip-review')}
+              disabled={actionLoading !== null}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-mc-bg hover:bg-mc-bg-tertiary text-mc-text-secondary border border-mc-border rounded text-sm transition-colors disabled:opacity-50"
+            >
+              <SkipForward className="w-3.5 h-3.5" />
+              {actionLoading === 'skip-review' ? 'Skipping...' : 'Skip to Review'}
+            </button>
+          </div>
+        )}
+
+        {task && task.status === 'review' && (
+          <div className="flex items-center gap-3 px-4 py-3 bg-blue-500/10 border-b border-blue-500/30 flex-shrink-0">
+            <div className="flex-1 text-sm text-blue-300">
+              <span className="font-medium">Review</span> — Awaiting your approval
+            </div>
+            <button
+              onClick={() => handleStatusAction('done', 'approve')}
+              disabled={actionLoading !== null}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-green-500/20 hover:bg-green-500/30 text-green-300 border border-green-500/40 rounded text-sm font-medium transition-colors disabled:opacity-50"
+            >
+              <Check className="w-3.5 h-3.5" />
+              {actionLoading === 'approve' ? 'Approving...' : 'Approve'}
+            </button>
+            <button
+              onClick={() => handleStatusAction('assigned', 'request-changes')}
+              disabled={actionLoading !== null}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-mc-bg hover:bg-mc-bg-tertiary text-mc-text-secondary border border-mc-border rounded text-sm transition-colors disabled:opacity-50"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              {actionLoading === 'request-changes' ? 'Sending back...' : 'Request Changes'}
+            </button>
           </div>
         )}
 
